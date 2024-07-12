@@ -102,20 +102,23 @@ fn main() -> std::io::Result<()> {
 #[allow(clippy::needless_pass_by_value)]
 fn run(path: &OsStr, (start, end): (usize, usize)) -> HashMap<Box<str>, Statistics> {
     let file = File::open(path).unwrap();
-    let mut map = HashMap::<Box<str>, Statistics>::with_capacity(420);
     let mut reader = BufReader::new(file);
+    let mut map = HashMap::<Box<str>, Statistics>::with_capacity(420);
     let mut buffer = String::with_capacity(128);
 
     for _ in 0..start {
         reader.read_line(&mut buffer).unwrap();
+        buffer.clear();
     }
-
-    buffer.clear();
 
     let mut index = start;
 
     while index < end && reader.read_line(&mut buffer).is_ok_and(|n| n > 0) {
         buffer.pop();
+
+        if buffer.is_empty() {
+            break;
+        }
 
         let (name, value) = buffer.split_once(';').unwrap();
         let name = Box::from(name);

@@ -8,4 +8,7 @@ edition = "2021"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/Jaxydog/billion-row-challenge"
 
+[profile.release]
+debug = true
+
 [dependencies]
