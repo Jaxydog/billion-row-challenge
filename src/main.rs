@@ -1,62 +1,13 @@
-#![deny(clippy::expect_used, clippy::unwrap_used)]
 #![warn(clippy::nursery, clippy::todo, clippy::pedantic)]
 
 use std::{
     collections::HashMap,
+    ffi::OsStr,
     fs::File,
-    io::{BufRead, BufReader},
-    sync::{mpsc::Sender, Arc},
+    io::{BufRead, BufReader, Write},
+    sync::Mutex,
     thread::available_parallelism,
 };
-
-pub struct Cursor<'fl> {
-    pub read: BufReader<&'fl File>,
-    pub range: (usize, usize),
-    pub index: usize,
-}
-
-impl<'fl> Cursor<'fl> {
-    #[must_use]
-    pub fn new(file: &'fl File, range: (usize, usize)) -> Self {
-        let mut read = BufReader::new(file);
-        let mut index = 0;
-        let mut buffer = String::with_capacity(128);
-
-        while index < range.0 {
-            read.read_line(&mut buffer).ok();
-
-            index += 1;
-        }
-
-        Self { read, range, index }
-    }
-
-    #[must_use]
-    pub const fn is_done(&self) -> bool {
-        self.range.0 + self.index >= self.range.1
-    }
-}
-
-impl<'fl> Iterator for Cursor<'fl> {
-    type Item = (Box<str>, f64);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.is_done() {
-            return None;
-        }
-
-        self.index += 1;
-
-        let mut string = String::with_capacity(128);
-
-        self.read.read_line(&mut string).ok()?;
-
-        let (name, value) = string.split_once(';')?;
-        let value = value.trim().parse().ok()?;
-
-        Some((name.into(), value))
-    }
-}
 
 #[derive(Debug)]
 pub struct Statistics {
@@ -88,76 +39,99 @@ impl Statistics {
 
 #[allow(clippy::unwrap_used)]
 fn main() -> std::io::Result<()> {
+    const DEFAULT_LINES: usize = 1_000_000_000;
+
     let mut arguments = std::env::args_os().skip(1);
+    let path = arguments.next().expect("missing file path");
+    let line_count = arguments.next().map_or(DEFAULT_LINES, |s| s.to_string_lossy().parse().unwrap());
 
-    let Some(path) = arguments.next() else {
-        panic!("expected a file path");
-    };
-    let lines = arguments.next().map_or(1_000_000_000_usize, |s| s.to_string_lossy().parse().unwrap());
+    let thread_count = available_parallelism()?.get();
+    let lines_per_thread = line_count / thread_count;
+    let results = Mutex::new(Vec::with_capacity(thread_count));
 
-    let threads = available_parallelism()?.get();
-    let lines_per_thread = lines / threads;
+    std::thread::scope(|scope| {
+        for iteration in 0..thread_count {
+            let path = &path;
+            let start = iteration * lines_per_thread;
+            let range = (start, start + lines_per_thread);
+            let results = &results;
 
-    let file = Arc::new(File::open(path)?);
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let mut thread_pool = Vec::with_capacity(threads);
+            scope.spawn(move || {
+                let result = run(path, range);
 
-    for iteration in 0..threads {
-        let file = Arc::clone(&file);
-        let start = iteration * lines_per_thread;
-        let range = (start, start + lines_per_thread);
-        let sender = sender.clone();
+                results.lock().unwrap().push(result);
+            });
+        }
+    });
 
-        thread_pool.push(std::thread::spawn(move || process(file, range, sender)));
-    }
+    let mut statistics = HashMap::<Box<str>, Statistics>::new();
 
-    drop(sender);
-
-    let mut finished = 0;
-    let mut finalized = HashMap::<_, Statistics>::new();
-
-    loop {
-        let map = receiver.recv().unwrap();
-
-        for (name, statistics) in map {
-            if let Some(entry) = finalized.get_mut(&name) {
-                entry.combine(&statistics);
+    for map in results.into_inner().unwrap() {
+        for (name, data) in map {
+            if let Some(stored) = statistics.get_mut(&name) {
+                stored.combine(&data);
             } else {
-                finalized.insert(name, statistics);
+                statistics.insert(name, data);
             }
         }
+    }
 
-        finished += 1;
+    let mut statistics = statistics.into_iter().collect::<Box<[_]>>();
+    let mut stdout = std::io::stdout().lock();
 
-        if finished >= threads {
-            break;
+    statistics.sort_unstable_by_key(|(k, _)| k.clone());
+
+    stdout.write_all(&[b'{'])?;
+
+    #[allow(clippy::cast_precision_loss)]
+    for (index, (name, data)) in statistics.iter().enumerate() {
+        let min = data.min;
+        let max = data.max;
+        let mean = data.sum / data.count as f64;
+
+        write!(&mut stdout, "{name}={min}/{mean:.1}/{max}")?;
+
+        if index < statistics.len() - 1 {
+            stdout.write_all(&[b','])?;
         }
     }
 
-    for handle in thread_pool {
-        handle.join().unwrap();
-    }
-
-    println!("{finalized:#?}");
-
-    Ok(())
+    stdout.write_all(&[b'}'])
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn process(file: Arc<File>, range: (usize, usize), sender: Sender<HashMap<Box<str>, Statistics>>) {
-    let cursor = Cursor::new(&file, range);
+fn run(path: &OsStr, (start, end): (usize, usize)) -> HashMap<Box<str>, Statistics> {
+    let file = File::open(path).unwrap();
     let mut map = HashMap::<Box<str>, Statistics>::with_capacity(420);
+    let mut reader = BufReader::new(file);
+    let mut buffer = String::with_capacity(128);
 
-    for (name, value) in cursor {
-        let statistics = dbg!(Statistics::new(value));
+    for _ in 0..start {
+        reader.read_line(&mut buffer).unwrap();
+    }
+
+    buffer.clear();
+
+    let mut index = start;
+
+    while index < end && reader.read_line(&mut buffer).is_ok_and(|n| n > 0) {
+        buffer.pop();
+
+        let (name, value) = buffer.split_once(';').unwrap();
+        let name = Box::from(name);
+        let value = value.parse().unwrap();
+
+        let statistics = Statistics::new(value);
 
         if let Some(entry) = map.get_mut(&name) {
             entry.combine(&statistics);
         } else {
-            map.insert(name, Statistics::new(value));
+            map.insert(name, statistics);
         }
+
+        index += 1;
+        buffer.clear();
     }
 
-    #[allow(clippy::unwrap_used)]
-    sender.send(map).unwrap();
+    map
 }
