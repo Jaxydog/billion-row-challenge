@@ -1,6 +1,11 @@
 [package]
 name = "billion-row-challenge"
+description = "An implementation of the billion-row challenge. Not intended as an actual submission."
+authors = ["Jaxydog"]
+
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/Jaxydog/billion-row-challenge"
 
 [dependencies]
