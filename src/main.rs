@@ -2,8 +2,11 @@
 #![warn(clippy::nursery, clippy::todo, clippy::pedantic)]
 
 use std::{
+    collections::HashMap,
     fs::File,
     io::{BufRead, BufReader},
+    sync::{mpsc::Sender, Arc},
+    thread::available_parallelism,
 };
 
 pub struct Cursor<'fl> {
@@ -55,22 +58,106 @@ impl<'fl> Iterator for Cursor<'fl> {
     }
 }
 
-pub enum Message {
-    Next { name: Box<str>, value: f64 },
-    Done,
+#[derive(Debug)]
+pub struct Statistics {
+    pub min: f64,
+    pub max: f64,
+    pub sum: f64,
+    pub count: usize,
 }
 
-fn main() -> std::io::Result<()> {
-    let Some(path) = std::env::args_os().nth(1) else {
-        panic!("expected a file path");
-    };
-
-    let file = File::open(path)?;
-    let cursor = Cursor::new(&file, (0, 10));
-
-    for value in cursor {
-        println!("{} => {}", value.0, value.1);
+impl Statistics {
+    #[must_use]
+    pub const fn new(value: f64) -> Self {
+        Self { min: value, max: value, sum: value, count: 1 }
     }
 
+    #[allow(clippy::cast_precision_loss)]
+    #[must_use]
+    pub fn average(&self) -> f64 {
+        self.sum / self.count as f64
+    }
+
+    pub fn combine(&mut self, other: &Self) {
+        self.min = self.min.min(other.min);
+        self.max = self.max.max(other.max);
+        self.sum += other.sum;
+        self.count += other.count;
+    }
+}
+
+#[allow(clippy::unwrap_used)]
+fn main() -> std::io::Result<()> {
+    let mut arguments = std::env::args_os().skip(1);
+
+    let Some(path) = arguments.next() else {
+        panic!("expected a file path");
+    };
+    let lines = arguments.next().map_or(1_000_000_000_usize, |s| s.to_string_lossy().parse().unwrap());
+
+    let threads = available_parallelism()?.get();
+    let lines_per_thread = lines / threads;
+
+    let file = Arc::new(File::open(path)?);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut thread_pool = Vec::with_capacity(threads);
+
+    for iteration in 0..threads {
+        let file = Arc::clone(&file);
+        let start = iteration * lines_per_thread;
+        let range = (start, start + lines_per_thread);
+        let sender = sender.clone();
+
+        thread_pool.push(std::thread::spawn(move || process(file, range, sender)));
+    }
+
+    drop(sender);
+
+    let mut finished = 0;
+    let mut finalized = HashMap::<_, Statistics>::new();
+
+    loop {
+        let map = receiver.recv().unwrap();
+
+        for (name, statistics) in map {
+            if let Some(entry) = finalized.get_mut(&name) {
+                entry.combine(&statistics);
+            } else {
+                finalized.insert(name, statistics);
+            }
+        }
+
+        finished += 1;
+
+        if finished >= threads {
+            break;
+        }
+    }
+
+    for handle in thread_pool {
+        handle.join().unwrap();
+    }
+
+    println!("{finalized:#?}");
+
     Ok(())
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn process(file: Arc<File>, range: (usize, usize), sender: Sender<HashMap<Box<str>, Statistics>>) {
+    let cursor = Cursor::new(&file, range);
+    let mut map = HashMap::<Box<str>, Statistics>::with_capacity(420);
+
+    for (name, value) in cursor {
+        let statistics = dbg!(Statistics::new(value));
+
+        if let Some(entry) = map.get_mut(&name) {
+            entry.combine(&statistics);
+        } else {
+            map.insert(name, Statistics::new(value));
+        }
+    }
+
+    #[allow(clippy::unwrap_used)]
+    sender.send(map).unwrap();
 }
